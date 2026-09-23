@@ -1,18 +1,32 @@
 # CapCut Bridge Kit
 
 CapCut has no API. This kit drives it two other ways: editing its draft files
-directly on disk, and clicking its real UI through the macOS accessibility
-tree. macOS only, needs the CapCut desktop app and `uv` (`brew install uv`).
+directly on disk, and clicking its real UI through the OS accessibility tree.
 
-Run any command with:
+**Two scripts, two platforms:**
 
-```bash
-uv run capcut-bridge.py <command> ...
-```
+- [`capcut-bridge-macos.py`](capcut-bridge-macos.py) — the original kit.
+  macOS only, needs the CapCut desktop app and `uv` (`brew install uv`). Run
+  with `uv run capcut-bridge-macos.py <command> ...` — its `# /// script`
+  header declares its two dependencies (`pyobjc-framework-ApplicationServices`,
+  `pyobjc-framework-Quartz`) and `uv run` installs them on first use.
+- [`capcut-bridge-windows.py`](capcut-bridge-windows.py) — a **file-lane-only**
+  Windows port (added 2026-09-23). Pure stdlib, no `uv`, no third-party
+  packages — just `python capcut-bridge-windows.py <command> ...`, plus
+  `ffmpeg`/`ffprobe` on PATH. The live lane (clicking the open editor via
+  macOS's accessibility tree) has no Windows equivalent in this kit and is
+  **not ported** — see the header comment in that file for exactly what that
+  means and what's still unverified. Draft-registry paths and file layout
+  differ from macOS (Windows keeps the draft's JSON as `draft_content.json`
+  under `%LOCALAPPDATA%\CapCut\User Data\Projects\com.lveditor.draft\`,
+  not `draft_info.json` under `~/Movies/...`) — validated against a real
+  Windows CapCut install: `replay` produces a draft CapCut's home screen
+  correctly loads (right thumbnail, right duration).
 
-The script's `# /// script` header declares its two dependencies
-(`pyobjc-framework-ApplicationServices`, `pyobjc-framework-Quartz`) — `uv run`
-installs them itself on first use, no setup step needed.
+The rest of this README describes the **macOS** script's behavior in detail;
+the Windows port implements the same file-lane commands against the same
+JSON schema, just with Windows-native paths and process control (`tasklist`/
+`taskkill` instead of `pgrep`/`osascript`).
 
 ## The two lanes
 
