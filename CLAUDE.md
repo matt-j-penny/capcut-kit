@@ -18,4 +18,4 @@ assume are installed. `capcut-templates/` (raw material stubs `add-text`/
 `graphics` fill in) is **not included** — see README for how to source it.
 
 Run all commands via `uv run capcut-bridge.py <command> ...` — see README for
-the full list. macOS only.
+the full list. File lane on macOS and Windows, live lane macOS only.

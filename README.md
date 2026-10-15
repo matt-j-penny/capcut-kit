@@ -2,7 +2,9 @@
 
 CapCut has no API. This kit drives it two other ways: editing its draft files
 directly on disk, and clicking its real UI through the macOS accessibility
-tree. macOS only, needs the CapCut desktop app and `uv` (`brew install uv`).
+tree. Needs the CapCut desktop app and `uv` (`brew install uv`, or
+`winget install astral-sh.uv` on Windows). The file lane runs on macOS and
+Windows; the live lane is macOS only (see [Windows](#windows)).
 
 Run any command with:
 
@@ -13,6 +15,37 @@ uv run capcut-bridge.py <command> ...
 The script's `# /// script` header declares its two dependencies
 (`pyobjc-framework-ApplicationServices`, `pyobjc-framework-Quartz`) — `uv run`
 installs them itself on first use, no setup step needed.
+
+## Windows
+
+The file lane (`replay`, `add-overlay`, `add-text`, `graphics`, `transform`,
+`remove`, `keyframe`, `clear-keyframes`, `ls`) plus `launch`/`quit` work on
+Windows. Validated 2026-10-15 on CapCut 9.6.0 for Windows: a `replay` draft
+shows up on the home screen and opens with its cuts on the timeline.
+
+What differs from macOS, all handled by the script:
+
+- Drafts live in the folder set in CapCut's settings, read from
+  `%LOCALAPPDATA%\CapCut\User Data\Config\globalSetting`
+  (`currentCustomDraftPath`), by default
+  `%LOCALAPPDATA%\CapCut\User Data\Projects\com.lveditor.draft`.
+- The timeline JSON is `draft_content.json`, not `draft_info.json`. It is plain
+  JSON on 9.6 (not encrypted). Override with `CAPCUT_DRAFT_FILE` if a version
+  changes that.
+- Quitting: a plain `taskkill` (no `/F`) is the same as clicking the X. From the
+  editor it only closes the draft back to the home screen, so the bridge
+  repeats it until no CapCut window is left, then lets the helper processes
+  exit (forcing only stragglers that have no window).
+- No sandbox, but footage is still linked into the draft's `Resources/` so the
+  draft stays self-contained.
+
+The live lane is not ported: CapCut's QML UI reaches Windows UI Automation
+without the automation IDs the macOS lane finds elements by (names come back
+empty), so live commands exit with a message. Open the draft in CapCut by hand
+after a file-lane write.
+
+Job folders (`projects/<job>/`) are looked up in `CAPCUT_JOBS` when set,
+otherwise in the kit's own `projects/`, otherwise next to the kit.
 
 ## The two lanes
 

@@ -2,12 +2,14 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#   "pyobjc-framework-ApplicationServices",
-#   "pyobjc-framework-Quartz",
+#   "pyobjc-framework-ApplicationServices; sys_platform == 'darwin'",
+#   "pyobjc-framework-Quartz; sys_platform == 'darwin'",
 # ]
 # ///
 # CapCut bridge: drive the CapCut Mac app live + replay a job's EDL into a new
-# CapCut draft. macOS only. Two lanes, validated 2026-07-27 on CapCut 8.9.0:
+# CapCut draft. Two lanes, validated 2026-07-27 on CapCut 8.9.0 for macOS; the
+# FILE lane also runs on Windows (validated 2026-10-15 on CapCut 9.6.0, where
+# the timeline JSON is draft_content.json — see README "Windows"):
 #
 #   FILE lane  - CapCut has no API; drafts are plaintext JSON in
 #                ~/Movies/CapCut/User Data/Projects/com.lveditor.draft/.
@@ -65,6 +67,7 @@ Usage — live lane (open editor, no restart):
   shot [out.png]                           # window grab for QA
   dump [needle] · click <name> · clickxy <x> <y> · key <combo>"""
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -72,59 +75,151 @@ import time
 import uuid
 from pathlib import Path
 
-DRAFT_ROOT = Path.home() / "Movies/CapCut/User Data/Projects/com.lveditor.draft"
+IS_MAC = sys.platform == "darwin"
+IS_WIN = sys.platform == "win32"
 APP = "CapCut"
+
+
+def _draft_root():
+    if not IS_WIN:
+        return Path.home() / "Movies/CapCut/User Data/Projects/com.lveditor.draft"
+    # Windows keeps the draft folder in a user-changeable setting; honour it.
+    user_data = Path(os.environ.get("LOCALAPPDATA", "")) / "CapCut/User Data"
+    try:
+        for line in (user_data / "Config/globalSetting").read_text(
+                encoding="utf-8", errors="ignore").splitlines():
+            if line.startswith("currentCustomDraftPath="):
+                return Path(line.split("=", 1)[1].strip().replace("\\\\", "\\"))
+    except OSError:
+        pass
+    return user_data / "Projects/com.lveditor.draft"
+
+
+DRAFT_ROOT = _draft_root()
+# The timeline JSON's name differs by platform: the Mac app reads
+# draft_info.json, the Windows app draft_content.json. Existing drafts win.
+DRAFT_FILE = os.environ.get("CAPCUT_DRAFT_FILE",
+                            "draft_content.json" if IS_WIN else "draft_info.json")
+
+
+def draft_json(folder):
+    for n in (DRAFT_FILE, "draft_info.json", "draft_content.json"):
+        if (folder / n).exists():
+            return folder / n
+    return folder / DRAFT_FILE
 
 # ---------------------------------------------------------------- app lifecycle
 
 
+def _win_capcut_exe():
+    apps = Path(os.environ.get("LOCALAPPDATA", "")) / "CapCut/Apps"
+    versions = sorted((p for p in apps.glob("*/CapCut.exe")),
+                      key=lambda p: [int(x) if x.isdigit() else 0
+                                     for x in p.parent.name.split(".")])
+    return versions[-1] if versions else apps / "CapCut.exe"
+
+
 def app_pid():
+    if IS_WIN:
+        out = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {APP}.exe", "/FO", "CSV",
+                              "/NH"], capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            parts = line.strip().strip('"').split('","')
+            if len(parts) > 1 and parts[0].lower() == f"{APP}.exe".lower():
+                return int(parts[1])
+        return None
     try:
         return int(subprocess.check_output(["pgrep", "-x", APP]).split()[0])
     except subprocess.CalledProcessError:
         return None
 
 
-def quit_app(timeout=20):
+def _win_windowed():
+    """CapCut.exe processes that still own a titled window."""
+    out = subprocess.run(["tasklist", "/V", "/FI", f"IMAGENAME eq {APP}.exe", "/FO",
+                          "CSV", "/NH"], capture_output=True, text=True,
+                         errors="ignore").stdout
+    rows = [line.strip().strip('"').split('","') for line in out.splitlines()]
+    return [r for r in rows if len(r) > 2 and r[0].lower() == f"{APP}.exe".lower()
+            and "capcut" in r[-1].lower()]  # helpers show a localized "N/A"
+
+
+def _win_quit(timeout):
+    """A plain (non-/F) taskkill posts WM_CLOSE, i.e. the same as clicking the X:
+    from the editor that closes the draft back to the home screen (saving it), a
+    second one quits the app and rewrites the registry. So close until no CapCut
+    window is left, then give the windowless helper processes time to exit on
+    their own and force only those stragglers."""
+    t0 = time.time()
+    while _win_windowed():
+        if time.time() - t0 > timeout:
+            sys.exit(f"CapCut did not quit within {timeout}s, close it and re-run")
+        subprocess.run(["taskkill", "/IM", f"{APP}.exe"], capture_output=True)
+        time.sleep(4)
+    t1 = time.time()
+    while app_pid() is not None and time.time() - t1 < 10:
+        time.sleep(0.5)
+    if app_pid() is not None:
+        subprocess.run(["taskkill", "/F", "/IM", f"{APP}.exe"], capture_output=True)
+    time.sleep(1.0)
+
+
+def quit_app(timeout=40):
     if app_pid() is None:
         return
-    subprocess.run(["osascript", "-e", f'tell application "{APP}" to quit'], check=False)
+    if IS_WIN:
+        _win_quit(timeout)
+        return
+    else:
+        subprocess.run(["osascript", "-e", f'tell application "{APP}" to quit'], check=False)
     t0 = time.time()
     while app_pid() is not None:
         if time.time() - t0 > timeout:
             sys.exit(f"CapCut did not quit within {timeout}s, close it and re-run")
         time.sleep(0.5)
+    time.sleep(1.0)  # let helper processes flush the registry before we touch it
 
 
 def launch_app():
+    if IS_WIN:
+        subprocess.Popen([str(_win_capcut_exe())], close_fds=True,
+                         creationflags=subprocess.DETACHED_PROCESS)
+        return
     subprocess.run(["open", "-a", APP], check=True)
     subprocess.run(["osascript", "-e", f'tell application "{APP}" to activate'], check=False)
 
 
 # ---------------------------------------------------------------- AX driver
+# macOS only. On Windows CapCut's QML tree reaches UI Automation without the
+# automation IDs (names come back empty), so the live lane is not ported there.
 
-from ApplicationServices import (  # noqa: E402
-    AXUIElementCreateApplication,
-    AXUIElementCopyAttributeValue,
-    AXValueGetValue,
-    kAXValueCGPointType,
-    kAXValueCGSizeType,
-)
-from Quartz import (  # noqa: E402
-    CGEventCreateKeyboardEvent,
-    CGEventCreateMouseEvent,
-    CGEventPost,
-    CGEventSetFlags,
-    CGEventSetIntegerValueField,
-    kCGEventFlagMaskCommand,
-    kCGEventFlagMaskShift,
-    kCGEventLeftMouseDown,
-    kCGEventLeftMouseUp,
-    kCGEventMouseMoved,
-    kCGHIDEventTap,
-    kCGMouseButtonLeft,
-    kCGMouseEventClickState,
-)
+LIVE_CMDS = {"seek", "select", "split", "delete", "del", "trim-left", "trim-right",
+             "undo", "redo", "marker", "zoomfit", "save", "export", "shot", "state",
+             "open", "dump", "click", "clickxy", "clips", "playhead", "play", "key"}
+
+if IS_MAC:
+    from ApplicationServices import (  # noqa: E402
+        AXUIElementCreateApplication,
+        AXUIElementCopyAttributeValue,
+        AXValueGetValue,
+        kAXValueCGPointType,
+        kAXValueCGSizeType,
+    )
+    from Quartz import (  # noqa: E402
+        CGEventCreateKeyboardEvent,
+        CGEventCreateMouseEvent,
+        CGEventPost,
+        CGEventSetFlags,
+        CGEventSetIntegerValueField,
+        kCGEventFlagMaskCommand,
+        kCGEventFlagMaskShift,
+        kCGEventLeftMouseDown,
+        kCGEventLeftMouseUp,
+        kCGEventMouseMoved,
+        kCGHIDEventTap,
+        kCGMouseButtonLeft,
+        kCGMouseEventClickState,
+    )
 
 KEYCODES = {"space": 49, "return": 36, "escape": 53, "delete": 51, "tab": 48,
             "left": 123, "right": 124, "down": 125, "up": 126,
@@ -263,7 +358,7 @@ def parse_tc(tc, fps):
 def draft_fps(name=None):
     if name:
         try:
-            return json.loads((DRAFT_ROOT / name / "draft_info.json").read_text())["fps"]
+            return json.loads(draft_json(DRAFT_ROOT / name).read_text(encoding="utf-8"))["fps"]
         except (OSError, KeyError, json.JSONDecodeError):
             pass
     return 30.0
@@ -410,11 +505,15 @@ def uid():
 
 def platform_block():
     # Lift device ids from an existing local draft so the new one reads as native.
-    for p in sorted(DRAFT_ROOT.glob("*/draft_info.json")):
+    for p in sorted(DRAFT_ROOT.glob("*/draft_*.json")):
         try:
-            return json.loads(p.read_text())["platform"]
+            return json.loads(p.read_text(encoding="utf-8"))["platform"]
         except (KeyError, json.JSONDecodeError):
             continue
+    if IS_WIN:
+        return {"os": "windows", "os_version": "", "app_id": 359289,
+                "app_version": _win_capcut_exe().parent.name, "app_source": "cc",
+                "device_id": "", "hard_disk_id": "", "mac_address": ""}
     return {"os": "mac", "os_version": "", "app_id": 359289, "app_version": "8.9.0",
             "app_source": "cc", "device_id": "", "hard_disk_id": "", "mac_address": ""}
 
@@ -558,18 +657,24 @@ EMPTY_MATERIAL_CATS = [
 ]
 
 
-def build_draft(name, raw_path, cuts, canvas_w, canvas_h):
-    w, h, raw_dur_us, has_audio = probe(raw_path)
+def build_draft(name, media, cuts, canvas_w, canvas_h):
+    """media: {clip name: local path}. Segments may come from different clips
+    (several takes of one video); each clip becomes one video material."""
     plat = platform_block()
     materials = {cat: [] for cat in EMPTY_MATERIAL_CATS}
-    mid = uid()
-    materials["videos"].append(video_material(mid, raw_path, w, h, raw_dur_us, has_audio))
+    mids = {}
+    for clip, path in media.items():
+        w, h, dur_us, has_audio = probe(path)
+        mids[clip] = uid()
+        materials["videos"].append(
+            video_material(mids[clip], path, w, h, dur_us, has_audio))
 
     segments = []
     cursor = 0
     for s in cuts["segments"]:
         src = round(s["start"] * 1e6)
         dur = round((s["end"] - s["start"]) * 1e6)
+        mid = mids[s.get("clip") or cuts["clip"]]
         segments.append(segment(mid, src, dur, cursor, segment_extras(materials)))
         cursor += dur
 
@@ -607,11 +712,24 @@ def build_draft(name, raw_path, cuts, canvas_w, canvas_h):
                                            "order": "", "sub_template_info_list": []},
         "draft_type": "video",
         "smart_ads_info": {"page_from": "", "routine": "", "draft_url": ""},
-    }, raw_dur_us, w, h
+    }
 
 
-def meta_entry(name, folder, draft_id, raw_path, raw_dur_us, w, h, total_us, now_us):
+def meta_entry(name, folder, draft_id, media, total_us, now_us):
     now_s = now_us // 1_000_000
+    imported = []
+    for path in media.values():
+        w, h, dur_us, _ = probe(path)
+        imported.append({
+            "ai_group_type": "", "create_time": now_s, "duration": dur_us,
+            "enter_from": 0, "extra_info": Path(path).name,
+            "file_Path": str(path), "height": h,
+            "id": str(uuid.uuid4()), "import_time": now_s,
+            "import_time_ms": now_us, "item_source": 1, "md5": "",
+            "metetype": "video",
+            "roughcut_time_range": {"duration": dur_us, "start": 0},
+            "sub_time_range": {"duration": -1, "start": -1},
+            "type": 0, "width": w})
     return {
         "cloud_draft_cover": False, "cloud_draft_sync": False,
         "cloud_package_completed_time": "", "draft_cloud_capcut_purchase_info": "",
@@ -630,16 +748,7 @@ def meta_entry(name, folder, draft_id, raw_path, raw_dur_us, w, h, total_us, now
         "draft_is_from_deeplink": "false", "draft_is_invisible": False,
         "draft_is_pippit_draft": False, "draft_is_web_article_video": False,
         "draft_materials": [
-            {"type": 0, "value": [{
-                "ai_group_type": "", "create_time": now_s, "duration": raw_dur_us,
-                "enter_from": 0, "extra_info": Path(raw_path).name,
-                "file_Path": str(raw_path), "height": h,
-                "id": str(uuid.uuid4()), "import_time": now_s,
-                "import_time_ms": now_us, "item_source": 1, "md5": "",
-                "metetype": "video",
-                "roughcut_time_range": {"duration": raw_dur_us, "start": 0},
-                "sub_time_range": {"duration": -1, "start": -1},
-                "type": 0, "width": w}]},
+            {"type": 0, "value": imported},
             {"type": 1, "value": []}, {"type": 2, "value": []},
             {"type": 3, "value": []}, {"type": 6, "value": []},
             {"type": 7, "value": []},
@@ -670,7 +779,7 @@ def registry_entry(name, folder, draft_id, total_us, now_us):
         "draft_is_ai_shorts": False, "draft_is_cloud_temp_draft": False,
         "draft_is_invisible": False, "draft_is_pippit_draft": False,
         "draft_is_web_article_video": False,
-        "draft_json_file": str(folder / "draft_info.json"), "draft_name": name,
+        "draft_json_file": str(draft_json(folder)), "draft_name": name,
         "draft_new_version": "", "draft_root_path": str(DRAFT_ROOT),
         "draft_timeline_materials_size": 0, "draft_type": "",
         "draft_web_article_video_enter_from": "", "pippit_avatar_url": "",
@@ -684,16 +793,26 @@ def registry_entry(name, folder, draft_id, total_us, now_us):
     }
 
 
+def jobs_root():
+    """projects/<job>/ folders. CAPCUT_JOBS overrides; otherwise the kit's own
+    projects/ if present, else the parent repo's (the kit's original home)."""
+    if os.environ.get("CAPCUT_JOBS"):
+        return Path(os.environ["CAPCUT_JOBS"]).expanduser()
+    here = Path(__file__).resolve().parent
+    return here / "projects" if (here / "projects").exists() else here.parent / "projects"
+
+
 def cmd_replay(job, draft_name=None):
-    repo = Path(__file__).resolve().parent.parent
-    jobdir = repo / "projects" / job
+    jobdir = jobs_root() / job
     cuts_path = jobdir / "transcript" / "cuts.json"
     if not cuts_path.exists():
         sys.exit(f"no EDL at {cuts_path}, run rough-cut (RENDER=0) first")
-    cuts = json.loads(cuts_path.read_text())
-    raw = jobdir / "raw" / cuts["segments"][0]["clip"]
-    if not raw.exists():
-        sys.exit(f"raw footage missing: {raw}")
+    cuts = json.loads(cuts_path.read_text(encoding="utf-8"))
+    clips = list(dict.fromkeys(s.get("clip") or cuts["clip"] for s in cuts["segments"]))
+    raws = {c: jobdir / "raw" / c for c in clips}
+    for raw in raws.values():
+        if not raw.exists():
+            sys.exit(f"raw footage missing: {raw}")
     name = draft_name or job
     folder = DRAFT_ROOT / name
     if folder.exists():
@@ -706,37 +825,36 @@ def cmd_replay(job, draft_name=None):
 
     folder.mkdir(parents=True)
     (folder / "Resources").mkdir()
-    # CapCut is sandboxed with only assets.movies.read-write: it cannot read repo
-    # paths it was never handed, so the raw must live under ~/Movies. Hardlink
-    # (same APFS volume, zero bytes) into the draft folder; copy if that fails.
-    local_raw = folder / "Resources" / raw.name
-    try:
-        local_raw.hardlink_to(raw)
-    except OSError:
-        import shutil
-        shutil.copy2(raw, local_raw)
+    # CapCut on macOS is sandboxed with only assets.movies.read-write: it cannot
+    # read repo paths it was never handed, so the raw must live under ~/Movies.
+    # Hardlink (same volume, zero bytes) into the draft folder; copy if that
+    # fails. Windows CapCut is not sandboxed, but a self-contained draft folder
+    # survives the raw being moved, so both platforms do the same.
+    media = {c: local_media(folder, raw) for c, raw in raws.items()}
 
-    draft, raw_dur_us, w, h = build_draft(name, local_raw, cuts, 1920, 1080)
+    # Canvas follows the first clip, so vertical footage stays 9:16.
+    cw, ch, _, _ = probe(next(iter(media.values())))
+    draft = build_draft(name, media, cuts, cw, ch)
     now_us = time.time_ns() // 1000
     draft_id = uid()
-    (folder / "draft_info.json").write_text(
-        json.dumps(draft, ensure_ascii=False, separators=(",", ":")))
+    draft_json(folder).write_text(
+        json.dumps(draft, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     (folder / "draft_meta_info.json").write_text(json.dumps(
-        meta_entry(name, folder, draft_id, local_raw, raw_dur_us, w, h,
-                   draft["duration"], now_us),
-        ensure_ascii=False, separators=(",", ":")))
+        meta_entry(name, folder, draft_id, media, draft["duration"], now_us),
+        ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
     subprocess.run(  # home-screen tile cover, first kept frame; cosmetic only
         ["ffmpeg", "-v", "error", "-ss", str(cuts["segments"][0]["start"]),
-         "-i", str(raw), "-frames:v", "1", "-vf", "scale=480:-2",
+         "-i", str(raws[clips[0]]), "-frames:v", "1", "-vf", "scale=480:-2",
          str(folder / "draft_cover.jpg")], check=False)
 
     root_path = DRAFT_ROOT / "root_meta_info.json"
-    root = json.loads(root_path.read_text())
+    root = (json.loads(root_path.read_text(encoding="utf-8")) if root_path.exists()
+            else {"all_draft_store": [], "draft_ids": 0, "root_path": str(DRAFT_ROOT)})
     root["all_draft_store"].insert(
         0, registry_entry(name, folder, draft_id, draft["duration"], now_us))
     root["draft_ids"] = root.get("draft_ids", 0) + 1
-    root_path.write_text(json.dumps(root, ensure_ascii=False, separators=(",", ":")))
+    root_path.write_text(json.dumps(root, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
     n = len(cuts["segments"])
     print(f"draft '{name}': {n} segments, {draft['duration'] / 1e6:.2f}s, {folder}")
@@ -760,7 +878,8 @@ def edit_draft(name, mutate, reopen=True):
     was_running = app_pid() is not None
     quit_app()
 
-    d = json.loads((folder / "draft_info.json").read_text())
+    dj = draft_json(folder)
+    d = json.loads(dj.read_text(encoding="utf-8"))
     mutate(d, folder)
     # CapCut's own save normalizes text segments to source_timerange: null. That
     # is fine while IT owns the timeline state, but we wipe Timelines/ below to
@@ -773,14 +892,14 @@ def edit_draft(name, mutate, reopen=True):
                                          "duration": s["target_timerange"]["duration"]}
     d["duration"] = max((s["target_timerange"]["start"] + s["target_timerange"]["duration"]
                          for t in d["tracks"] for s in t["segments"]), default=0)
-    (folder / "draft_info.json").write_text(
-        json.dumps(d, ensure_ascii=False, separators=(",", ":")))
-    (folder / "draft_info.json.bak").unlink(missing_ok=True)
+    dj.write_text(json.dumps(d, ensure_ascii=False, separators=(",", ":")),
+                  encoding="utf-8")
+    dj.with_name(dj.name + ".bak").unlink(missing_ok=True)
     shutil.rmtree(folder / "Timelines", ignore_errors=True)
 
     if was_running:
         launch_app()
-        if reopen:
+        if reopen and IS_MAC:
             time.sleep(8)
             cmd_open(name)
     return d
@@ -860,7 +979,7 @@ def add_text(name, text, at, duration=3.0, level=1, force=False,
     def mutate(d, folder):
         if not force and already_at(d, round(at * 1e6), text=text):
             sys.exit(f"{text!r} is already at {at}s — pass --force to add a second copy")
-        tm = json.loads(tm_path.read_text())
+        tm = json.loads(tm_path.read_text(encoding="utf-8"))
         content = json.loads(tm["content"])
         content["text"] = text
         for style in content.get("styles", []):
@@ -869,11 +988,11 @@ def add_text(name, text, at, duration=3.0, level=1, force=False,
         tm["content"] = json.dumps(content, ensure_ascii=False)
         d["materials"]["texts"].append(tm)
 
-        anim = json.loads(anim_path.read_text())
+        anim = json.loads(anim_path.read_text(encoding="utf-8"))
         anim["id"] = uid()
         d["materials"]["material_animations"].append(anim)
 
-        seg = json.loads(seg_path.read_text())
+        seg = json.loads(seg_path.read_text(encoding="utf-8"))
         seg["id"] = uid()
         seg["material_id"] = tm["id"]
         seg["extra_material_refs"] = [anim["id"]]
@@ -1043,17 +1162,17 @@ def clear_keyframes(name, track_role, index):
 
 def cmd_graphics(name, job):
     """Batch-place every graphic a job's plan calls for, in ONE cache cycle."""
-    repo = Path(__file__).resolve().parent.parent
-    plan_path = repo / "projects" / job / "graphics-plan.json"
+    plan_path = jobs_root() / job / "graphics-plan.json"
     if not plan_path.exists():
         sys.exit(f"no graphics plan at {plan_path}")
-    plan = json.loads(plan_path.read_text())
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
     beats = plan.get("graphics") or plan.get("beats") or []
-    assets = repo / "projects" / job / "assets"
+    assets = jobs_root() / job / "assets"
     queued = []
     for b in beats:
         mov = b.get("file") or (f"{b['id']}.mov" if b.get("id") else None)
-        at = b.get("start") or b.get("t") or b.get("time")
+        # Not `or`: a graphic at 0.0s (the hook card) is falsy and was dropped.
+        at = next((b[k] for k in ("start", "t", "time") if b.get(k) is not None), None)
         if not mov or at is None:
             continue
         p = assets / mov
@@ -1180,9 +1299,9 @@ def cmd_state(name=None):
     live = timeline_clips()
     out = {"playhead": cur, "duration": tot, "live_clip_count": len(live)}
 
-    path = DRAFT_ROOT / name / "draft_info.json" if name else None
+    path = draft_json(DRAFT_ROOT / name) if name else None
     if path and path.exists():
-        d = json.loads(path.read_text())
+        d = json.loads(path.read_text(encoding="utf-8"))
         tracks = []
         for t in d["tracks"]:
             segs = []
@@ -1224,6 +1343,9 @@ def main():
     if not args:
         sys.exit(USAGE)
     cmd, rest = args[0], args[1:]
+    if cmd in LIVE_CMDS and not IS_MAC:
+        sys.exit(f"'{cmd}' is a live-lane command and needs macOS. On this platform "
+                 "use the file-lane commands, then open the draft in CapCut by hand.")
     if cmd == "replay":
         cmd_replay(rest[0], opt(rest, "--name"))
     elif cmd == "add-overlay":
@@ -1297,7 +1419,9 @@ def main():
     elif cmd == "state":
         cmd_state(opt(rest, "--draft"))
     elif cmd == "ls":
-        root = json.loads((DRAFT_ROOT / "root_meta_info.json").read_text())
+        root_path = DRAFT_ROOT / "root_meta_info.json"
+        root = (json.loads(root_path.read_text(encoding="utf-8"))
+                if root_path.exists() else {"all_draft_store": []})
         for d in root["all_draft_store"]:
             print(f"{d['draft_name']}: {d['tm_duration'] / 1e6:.2f}s  {d['draft_fold_path']}")
     elif cmd == "launch":

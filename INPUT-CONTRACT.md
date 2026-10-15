@@ -34,7 +34,12 @@ entry becomes one timeline segment.
 - `note` — human-readable description of the kept line, for review — not
   read programmatically by the bridge.
 - `clip` (top-level) — the raw file `replay` hardlinks into the draft's
-  `Resources/`; must exist alongside this file's parent job folder.
+  `Resources/`; must exist under the job's `raw/` folder.
+- `clip` (per segment, optional) — lets segments come from different raw
+  files (several takes of one video). Each one must exist under `raw/`;
+  segments without it use the top-level `clip`.
+- The draft canvas takes the first clip's resolution, so vertical (9:16)
+  footage gives a vertical draft.
 
 ## `graphics-plan.json` — read by `graphics <draft> <job>`
 
