@@ -2,12 +2,14 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#   "pyobjc-framework-ApplicationServices",
-#   "pyobjc-framework-Quartz",
+#   "pyobjc-framework-ApplicationServices; sys_platform == 'darwin'",
+#   "pyobjc-framework-Quartz; sys_platform == 'darwin'",
 # ]
 # ///
 # CapCut bridge: drive the CapCut Mac app live + replay a job's EDL into a new
-# CapCut draft. macOS only. Two lanes, validated 2026-07-27 on CapCut 8.9.0:
+# CapCut draft. Two lanes, validated 2026-07-27 on CapCut 8.9.0 (macOS). The
+# file lane also runs on Windows (drafts under %LOCALAPPDATA%\CapCut, or set
+# CAPCUT_DRAFTS); the live lane is macOS only.
 #
 #   FILE lane  - CapCut has no API; drafts are plaintext JSON in
 #                ~/Movies/CapCut/User Data/Projects/com.lveditor.draft/.
@@ -54,6 +56,7 @@ USAGE = """Usage — file lane (structural builds; quits + relaunches the app ar
   keyframe <draft> [--track ...] [--index N] --at <s> [--scale S] [--x X] [--y Y] [--rotate R] [--opacity O]
   clear-keyframes <draft> [--track ...] [--index N]
   ls                                       # drafts in the registry
+  doctor [--live]                          # check this machine; --live round-trips a test draft
 
 Usage — live lane (open editor, no restart):
   open <draft> · launch · quit
@@ -65,6 +68,7 @@ Usage — live lane (open editor, no restart):
   shot [out.png]                           # window grab for QA
   dump [needle] · click <name> · clickxy <x> <y> · key <combo>"""
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -72,13 +76,39 @@ import time
 import uuid
 from pathlib import Path
 
-DRAFT_ROOT = Path.home() / "Movies/CapCut/User Data/Projects/com.lveditor.draft"
+MAC = sys.platform == "darwin"
 APP = "CapCut"
+if os.environ.get("CAPCUT_DRAFTS"):
+    DRAFT_ROOT = Path(os.environ["CAPCUT_DRAFTS"]).expanduser()
+elif MAC:
+    DRAFT_ROOT = Path.home() / "Movies/CapCut/User Data/Projects/com.lveditor.draft"
+else:
+    DRAFT_ROOT = Path(os.environ.get("LOCALAPPDATA", "")) / "CapCut/User Data/Projects/com.lveditor.draft"
+# ponytail: default install path; set CAPCUT_EXE if CapCut lives elsewhere
+WIN_EXE = Path(os.environ.get("CAPCUT_EXE")
+               or Path(os.environ.get("LOCALAPPDATA", "")) / "CapCut/Apps/CapCut.exe")
+DRAFT_NAMES = ("draft_info.json", "draft_content.json") if MAC else ("draft_content.json", "draft_info.json")
+
+
+def detect_draft_file():
+    # Mac CapCut stores the timeline as draft_info.json; Windows builds may use
+    # draft_content.json. Follow whatever the existing drafts use.
+    if os.environ.get("CAPCUT_DRAFT_FILE"):
+        return os.environ["CAPCUT_DRAFT_FILE"]
+    seen = [p.name for n in DRAFT_NAMES for p in DRAFT_ROOT.glob(f"*/{n}")]
+    return max(DRAFT_NAMES, key=seen.count)
+
+
+DRAFT_FILE = detect_draft_file()
 
 # ---------------------------------------------------------------- app lifecycle
 
 
 def app_pid():
+    if not MAC:
+        out = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {APP}.exe", "/NH", "/FO", "CSV"],
+                             capture_output=True, text=True).stdout
+        return int(out.split('","')[1]) if out.startswith('"') else None
     try:
         return int(subprocess.check_output(["pgrep", "-x", APP]).split()[0])
     except subprocess.CalledProcessError:
@@ -88,43 +118,58 @@ def app_pid():
 def quit_app(timeout=20):
     if app_pid() is None:
         return
-    subprocess.run(["osascript", "-e", f'tell application "{APP}" to quit'], check=False)
+    if MAC:
+        subprocess.run(["osascript", "-e", f'tell application "{APP}" to quit'], check=False)
+    else:
+        # no /F: a graceful close lets CapCut write its registry before we touch it
+        subprocess.run(["taskkill", "/IM", f"{APP}.exe"], capture_output=True, check=False)
     t0 = time.time()
     while app_pid() is not None:
         if time.time() - t0 > timeout:
-            sys.exit(f"CapCut did not quit within {timeout}s, close it and re-run")
+            if not MAC and os.environ.get("CAPCUT_FORCE_QUIT"):
+                # a killed CapCut skips its registry rewrite, so this is safe for
+                # our write; it only loses unsaved edits in the open project
+                subprocess.run(["taskkill", "/F", "/IM", f"{APP}.exe"], capture_output=True)
+                time.sleep(2)
+                return
+            sys.exit(f"CapCut did not quit within {timeout}s, close it and re-run"
+                     + ("" if MAC else " (or set CAPCUT_FORCE_QUIT=1)"))
         time.sleep(0.5)
 
 
 def launch_app():
+    if not MAC:
+        os.startfile(WIN_EXE)
+        return
     subprocess.run(["open", "-a", APP], check=True)
     subprocess.run(["osascript", "-e", f'tell application "{APP}" to activate'], check=False)
 
 
 # ---------------------------------------------------------------- AX driver
 
-from ApplicationServices import (  # noqa: E402
-    AXUIElementCreateApplication,
-    AXUIElementCopyAttributeValue,
-    AXValueGetValue,
-    kAXValueCGPointType,
-    kAXValueCGSizeType,
-)
-from Quartz import (  # noqa: E402
-    CGEventCreateKeyboardEvent,
-    CGEventCreateMouseEvent,
-    CGEventPost,
-    CGEventSetFlags,
-    CGEventSetIntegerValueField,
-    kCGEventFlagMaskCommand,
-    kCGEventFlagMaskShift,
-    kCGEventLeftMouseDown,
-    kCGEventLeftMouseUp,
-    kCGEventMouseMoved,
-    kCGHIDEventTap,
-    kCGMouseButtonLeft,
-    kCGMouseEventClickState,
-)
+if MAC:
+    from ApplicationServices import (  # noqa: E402
+        AXUIElementCreateApplication,
+        AXUIElementCopyAttributeValue,
+        AXValueGetValue,
+        kAXValueCGPointType,
+        kAXValueCGSizeType,
+    )
+    from Quartz import (  # noqa: E402
+        CGEventCreateKeyboardEvent,
+        CGEventCreateMouseEvent,
+        CGEventPost,
+        CGEventSetFlags,
+        CGEventSetIntegerValueField,
+        kCGEventFlagMaskCommand,
+        kCGEventFlagMaskShift,
+        kCGEventLeftMouseDown,
+        kCGEventLeftMouseUp,
+        kCGEventMouseMoved,
+        kCGHIDEventTap,
+        kCGMouseButtonLeft,
+        kCGMouseEventClickState,
+    )
 
 KEYCODES = {"space": 49, "return": 36, "escape": 53, "delete": 51, "tab": 48,
             "left": 123, "right": 124, "down": 125, "up": 126,
@@ -263,7 +308,7 @@ def parse_tc(tc, fps):
 def draft_fps(name=None):
     if name:
         try:
-            return json.loads((DRAFT_ROOT / name / "draft_info.json").read_text())["fps"]
+            return json.loads((DRAFT_ROOT / name / DRAFT_FILE).read_text(encoding="utf-8-sig"))["fps"]
         except (OSError, KeyError, json.JSONDecodeError):
             pass
     return 30.0
@@ -410,12 +455,12 @@ def uid():
 
 def platform_block():
     # Lift device ids from an existing local draft so the new one reads as native.
-    for p in sorted(DRAFT_ROOT.glob("*/draft_info.json")):
+    for p in sorted(DRAFT_ROOT.glob(f"*/{DRAFT_FILE}")):
         try:
-            return json.loads(p.read_text())["platform"]
+            return json.loads(p.read_text(encoding="utf-8-sig"))["platform"]
         except (KeyError, json.JSONDecodeError):
             continue
-    return {"os": "mac", "os_version": "", "app_id": 359289, "app_version": "8.9.0",
+    return {"os": "mac" if MAC else "windows", "os_version": "", "app_id": 359289, "app_version": "8.9.0",
             "app_source": "cc", "device_id": "", "hard_disk_id": "", "mac_address": ""}
 
 
@@ -670,7 +715,7 @@ def registry_entry(name, folder, draft_id, total_us, now_us):
         "draft_is_ai_shorts": False, "draft_is_cloud_temp_draft": False,
         "draft_is_invisible": False, "draft_is_pippit_draft": False,
         "draft_is_web_article_video": False,
-        "draft_json_file": str(folder / "draft_info.json"), "draft_name": name,
+        "draft_json_file": str(folder / DRAFT_FILE), "draft_name": name,
         "draft_new_version": "", "draft_root_path": str(DRAFT_ROOT),
         "draft_timeline_materials_size": 0, "draft_type": "",
         "draft_web_article_video_enter_from": "", "pippit_avatar_url": "",
@@ -690,20 +735,29 @@ def cmd_replay(job, draft_name=None):
     cuts_path = jobdir / "transcript" / "cuts.json"
     if not cuts_path.exists():
         sys.exit(f"no EDL at {cuts_path}, run rough-cut (RENDER=0) first")
-    cuts = json.loads(cuts_path.read_text())
+    cuts = json.loads(cuts_path.read_text(encoding="utf-8-sig"))
     raw = jobdir / "raw" / cuts["segments"][0]["clip"]
     if not raw.exists():
         sys.exit(f"raw footage missing: {raw}")
     name = draft_name or job
-    folder = DRAFT_ROOT / name
-    if folder.exists():
-        sys.exit(f"draft folder already exists: {folder} (pick another --name)")
+    if (DRAFT_ROOT / name).exists():
+        sys.exit(f"draft folder already exists: {DRAFT_ROOT / name} (pick another --name)")
 
     was_running = app_pid() is not None
     if was_running:
         print("quitting CapCut (registry is rewritten on quit)...")
         quit_app()
 
+    folder, draft = write_draft(name, raw, cuts)
+    n = len(cuts["segments"])
+    print(f"draft '{name}': {n} segments, {draft['duration'] / 1e6:.2f}s, {folder}")
+    if was_running:
+        launch_app()
+        print("CapCut relaunched")
+
+
+def write_draft(name, raw, cuts):
+    folder = DRAFT_ROOT / name
     folder.mkdir(parents=True)
     (folder / "Resources").mkdir()
     # CapCut is sandboxed with only assets.movies.read-write: it cannot read repo
@@ -719,12 +773,12 @@ def cmd_replay(job, draft_name=None):
     draft, raw_dur_us, w, h = build_draft(name, local_raw, cuts, 1920, 1080)
     now_us = time.time_ns() // 1000
     draft_id = uid()
-    (folder / "draft_info.json").write_text(
-        json.dumps(draft, ensure_ascii=False, separators=(",", ":")))
+    (folder / DRAFT_FILE).write_text(
+        json.dumps(draft, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     (folder / "draft_meta_info.json").write_text(json.dumps(
         meta_entry(name, folder, draft_id, local_raw, raw_dur_us, w, h,
                    draft["duration"], now_us),
-        ensure_ascii=False, separators=(",", ":")))
+        ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
 
     subprocess.run(  # home-screen tile cover, first kept frame; cosmetic only
         ["ffmpeg", "-v", "error", "-ss", str(cuts["segments"][0]["start"]),
@@ -732,17 +786,12 @@ def cmd_replay(job, draft_name=None):
          str(folder / "draft_cover.jpg")], check=False)
 
     root_path = DRAFT_ROOT / "root_meta_info.json"
-    root = json.loads(root_path.read_text())
+    root = json.loads(root_path.read_text(encoding="utf-8-sig"))
     root["all_draft_store"].insert(
         0, registry_entry(name, folder, draft_id, draft["duration"], now_us))
     root["draft_ids"] = root.get("draft_ids", 0) + 1
-    root_path.write_text(json.dumps(root, ensure_ascii=False, separators=(",", ":")))
-
-    n = len(cuts["segments"])
-    print(f"draft '{name}': {n} segments, {draft['duration'] / 1e6:.2f}s, {folder}")
-    if was_running:
-        launch_app()
-        print("CapCut relaunched")
+    root_path.write_text(json.dumps(root, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    return folder, draft
 
 
 TEMPLATES = Path(__file__).resolve().parent / "capcut-templates"
@@ -760,7 +809,7 @@ def edit_draft(name, mutate, reopen=True):
     was_running = app_pid() is not None
     quit_app()
 
-    d = json.loads((folder / "draft_info.json").read_text())
+    d = json.loads((folder / DRAFT_FILE).read_text(encoding="utf-8-sig"))
     mutate(d, folder)
     # CapCut's own save normalizes text segments to source_timerange: null. That
     # is fine while IT owns the timeline state, but we wipe Timelines/ below to
@@ -773,14 +822,14 @@ def edit_draft(name, mutate, reopen=True):
                                          "duration": s["target_timerange"]["duration"]}
     d["duration"] = max((s["target_timerange"]["start"] + s["target_timerange"]["duration"]
                          for t in d["tracks"] for s in t["segments"]), default=0)
-    (folder / "draft_info.json").write_text(
-        json.dumps(d, ensure_ascii=False, separators=(",", ":")))
-    (folder / "draft_info.json.bak").unlink(missing_ok=True)
+    (folder / DRAFT_FILE).write_text(
+        json.dumps(d, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    (folder / f"{DRAFT_FILE}.bak").unlink(missing_ok=True)
     shutil.rmtree(folder / "Timelines", ignore_errors=True)
 
     if was_running:
         launch_app()
-        if reopen:
+        if reopen and MAC:  # reopening drives the UI, live lane only
             time.sleep(8)
             cmd_open(name)
     return d
@@ -860,7 +909,7 @@ def add_text(name, text, at, duration=3.0, level=1, force=False,
     def mutate(d, folder):
         if not force and already_at(d, round(at * 1e6), text=text):
             sys.exit(f"{text!r} is already at {at}s — pass --force to add a second copy")
-        tm = json.loads(tm_path.read_text())
+        tm = json.loads(tm_path.read_text(encoding="utf-8-sig"))
         content = json.loads(tm["content"])
         content["text"] = text
         for style in content.get("styles", []):
@@ -869,11 +918,11 @@ def add_text(name, text, at, duration=3.0, level=1, force=False,
         tm["content"] = json.dumps(content, ensure_ascii=False)
         d["materials"]["texts"].append(tm)
 
-        anim = json.loads(anim_path.read_text())
+        anim = json.loads(anim_path.read_text(encoding="utf-8-sig"))
         anim["id"] = uid()
         d["materials"]["material_animations"].append(anim)
 
-        seg = json.loads(seg_path.read_text())
+        seg = json.loads(seg_path.read_text(encoding="utf-8-sig"))
         seg["id"] = uid()
         seg["material_id"] = tm["id"]
         seg["extra_material_refs"] = [anim["id"]]
@@ -1047,7 +1096,7 @@ def cmd_graphics(name, job):
     plan_path = repo / "projects" / job / "graphics-plan.json"
     if not plan_path.exists():
         sys.exit(f"no graphics plan at {plan_path}")
-    plan = json.loads(plan_path.read_text())
+    plan = json.loads(plan_path.read_text(encoding="utf-8-sig"))
     beats = plan.get("graphics") or plan.get("beats") or []
     assets = repo / "projects" / job / "assets"
     queued = []
@@ -1180,9 +1229,9 @@ def cmd_state(name=None):
     live = timeline_clips()
     out = {"playhead": cur, "duration": tot, "live_clip_count": len(live)}
 
-    path = DRAFT_ROOT / name / "draft_info.json" if name else None
+    path = DRAFT_ROOT / name / DRAFT_FILE if name else None
     if path and path.exists():
-        d = json.loads(path.read_text())
+        d = json.loads(path.read_text(encoding="utf-8-sig"))
         tracks = []
         for t in d["tracks"]:
             segs = []
@@ -1219,12 +1268,198 @@ def opt(rest, flag, cast=str, default=None):
     return cast(rest[rest.index(flag) + 1]) if flag in rest else default
 
 
+def cmd_doctor(live=False):
+    """Check this machine can run the file lane and write capcut-doctor-report.txt.
+    --live also round-trips a real test draft through CapCut, asking you to confirm
+    what you see, so the report says which of the env-var fixes (if any) to use."""
+    import tempfile
+    lines = []
+
+    def say(status, msg, fix=None):
+        for line in [f"[{status}] {msg}"] + ([f"       fix: {fix}"] if fix else []):
+            print(line)
+            lines.append(line)
+
+    def yes(q):
+        return input(f"  ?  {q} [y/n] ").strip().lower().startswith("y")
+
+    say("INFO", f"{sys.platform}, Python {sys.version.split()[0]}, drafts at {DRAFT_ROOT}")
+    for tool in ("ffmpeg", "ffprobe"):
+        if shutil.which(tool):
+            say("PASS", f"{tool} on PATH")
+        else:
+            say("FAIL", f"{tool} not on PATH", "winget install Gyan.FFmpeg, then open a new terminal")
+
+    root_path = DRAFT_ROOT / "root_meta_info.json"
+    if not DRAFT_ROOT.is_dir():
+        found = [p for base in (Path(os.environ.get("LOCALAPPDATA", "")), Path.home())
+                 for p in base.glob("*/User Data/Projects/com.lveditor.draft")]
+        say("FAIL", "drafts folder not found",
+            f"set CAPCUT_DRAFTS={found[0]}" if found else
+            "in CapCut Settings find the draft location and set CAPCUT_DRAFTS to it")
+    elif not root_path.exists():
+        say("FAIL", "no root_meta_info.json (CapCut's draft list) in the drafts folder",
+            "make and save one draft in CapCut so it creates the list, then re-run")
+    else:
+        raw = root_path.read_bytes()
+        try:
+            root = json.loads(raw.decode("utf-8-sig"))
+            say("PASS", f"draft list readable, {len(root.get('all_draft_store', []))} draft(s)"
+                + (" (has a BOM, handled)" if raw.startswith(b"\xef\xbb\xbf") else ""))
+            if "all_draft_store" not in root:
+                say("FAIL", f"draft list has an unexpected shape, keys: {list(root)[:8]}")
+        except ValueError:
+            say("FAIL", f"draft list is not JSON (starts {raw[:16].hex()}), likely encrypted")
+
+    drafts = sorted((p for p in DRAFT_ROOT.glob("*") if p.is_dir()),
+                    key=lambda p: p.stat().st_mtime, reverse=True)[:5] if DRAFT_ROOT.is_dir() else []
+    if not drafts:
+        say("WARN", "no existing drafts to learn the format from",
+            "make one short draft in CapCut, quit CapCut, re-run")
+    for folder in drafts:
+        files = [n for n in DRAFT_NAMES if (folder / n).exists()]
+        if not files:
+            say("WARN", f"'{folder.name}': no draft_info/draft_content json, contains "
+                f"{sorted(p.name for p in folder.iterdir())[:10]}")
+            continue
+        data = (folder / files[0]).read_bytes()
+        try:
+            d = json.loads(data.decode("utf-8-sig"))
+        except ValueError:
+            say("FAIL", f"'{folder.name}/{files[0]}' is not JSON (starts {data[:16].hex()}): "
+                "this CapCut encrypts drafts, the file lane can't edit them")
+            continue
+        paths = [m.get("path", "") for m in d.get("materials", {}).get("videos", []) if m.get("path")]
+        say("PASS", f"'{folder.name}': {'+'.join(files)} is JSON, os={d.get('platform', {}).get('os')} "
+            f"app={d.get('platform', {}).get('app_version')}, "
+            f"Timelines/={'yes' if (folder / 'Timelines').exists() else 'no'}"
+            + (f", media path style {paths[0][:60]!r}" if paths else ""))
+    say("INFO", f"using {DRAFT_FILE} as the timeline file"
+        + (" (CAPCUT_DRAFT_FILE)" if os.environ.get("CAPCUT_DRAFT_FILE") else ""))
+
+    if not MAC:
+        if WIN_EXE.exists():
+            say("PASS", f"CapCut at {WIN_EXE}")
+        else:
+            hits = list(Path(os.environ.get("LOCALAPPDATA", "")).glob("CapCut/**/CapCut.exe"))
+            say("FAIL", f"CapCut not at {WIN_EXE}",
+                f"set CAPCUT_EXE={hits[0]}" if hits else "set CAPCUT_EXE to CapCut.exe's full path")
+
+    if DRAFT_ROOT.is_dir():
+        probe_dir = DRAFT_ROOT / ".capcut-kit-doctor"
+        src = Path.cwd() / ".capcut-kit-doctor-src"
+        try:
+            probe_dir.mkdir(exist_ok=True)
+            src.write_text("x")
+            try:
+                (probe_dir / "link").hardlink_to(src)
+                say("PASS", "drafts folder writable, hardlinks work from this folder")
+            except OSError:
+                say("WARN", "hardlink failed (footage on another drive?), media will be copied")
+        except OSError as e:
+            say("FAIL", f"can't write to the drafts folder: {e}")
+        finally:
+            src.unlink(missing_ok=True)
+            shutil.rmtree(probe_dir, ignore_errors=True)
+
+    if live:
+        doctor_live(say, yes, tempfile)
+    out = Path.cwd() / "capcut-doctor-report.txt"
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"\nreport written to {out}")
+
+
+def doctor_live(say, yes, tempfile):
+    name = "capcut-kit-doctor"
+    if (DRAFT_ROOT / name).exists():
+        say("FAIL", f"leftover test draft at {DRAFT_ROOT / name}", "delete it in CapCut, re-run")
+        return
+    if app_pid() is None:
+        launch_app()
+        time.sleep(15)
+    root_path = DRAFT_ROOT / "root_meta_info.json"
+    before = root_path.stat().st_mtime if root_path.exists() else 0
+    if not MAC:
+        subprocess.run(["taskkill", "/IM", f"{APP}.exe"], capture_output=True)
+    else:
+        subprocess.run(["osascript", "-e", f'tell application "{APP}" to quit'], check=False)
+    t0 = time.time()
+    while app_pid() is not None and time.time() - t0 < 20:
+        time.sleep(0.5)
+    if app_pid() is None:
+        say("PASS", "CapCut quits when asked politely")
+    else:
+        if MAC:
+            say("FAIL", "CapCut ignored the quit request")
+            return
+        subprocess.run(["taskkill", "/F", "/IM", f"{APP}.exe"], capture_output=True)
+        time.sleep(2)
+        say("WARN", "CapCut ignored a polite close (tray or prompt?), force-kill worked",
+            "set CAPCUT_FORCE_QUIT=1")
+    rewrote = root_path.exists() and root_path.stat().st_mtime != before
+    say("INFO", f"draft list {'was' if rewrote else 'was NOT'} rewritten on quit")
+
+    tmp = Path(tempfile.mkdtemp())
+    clip = tmp / "doctor-test.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=30",
+                    "-f", "lavfi", "-i", "sine", "-t", "6", "-shortest", str(clip)], check=True)
+    cuts = {"segments": [{"clip": clip.name, "start": 0.0, "end": 2.0},
+                         {"clip": clip.name, "start": 3.0, "end": 5.0}]}
+    folder, _ = write_draft(name, clip, cuts)
+    say("INFO", f"wrote test draft '{name}' ({DRAFT_FILE})")
+    launch_app()
+    print(f"\n  CapCut is starting. Open the draft '{name}' from the home screen.")
+    if not yes(f"Is '{name}' listed on the CapCut home screen?"):
+        say("FAIL", "CapCut didn't list the test draft (registry format differs)")
+        loaded = False
+    else:
+        loaded = yes("Does it open to a 4s colour test pattern, 2 clips on the timeline?")
+        say("PASS" if loaded else "FAIL", "CapCut " + ("loads" if loaded else "does NOT load")
+            + f" drafts written as {DRAFT_FILE}",
+            None if loaded else f"re-run with CAPCUT_DRAFT_FILE="
+            f"{next(n for n in DRAFT_NAMES if n != DRAFT_FILE)}")
+    say("INFO", f"after opening, the draft folder holds {sorted(p.name for p in folder.iterdir())}")
+
+    if loaded:
+        input("  Close CapCut (it may ask to save, say yes), then press Enter ")
+        quit_app()
+        root = json.loads(root_path.read_text(encoding="utf-8-sig"))
+        kept = any(e.get("draft_name") == name for e in root.get("all_draft_store", []))
+        say("PASS" if kept else "FAIL", f"test draft {'stayed in' if kept else 'was dropped from'} "
+            "the draft list on quit")
+        set_transform(name, "main", 0, scale=0.5)
+        launch_app()
+        print(f"  CapCut is starting. Open '{name}' again.")
+        edited = yes("Is the FIRST clip now half size?")
+        say("PASS" if edited else "FAIL", "edits to an already-opened draft "
+            + ("stick" if edited else "are ignored (CapCut's cache isn't Timelines/ here; "
+                                      "see folder listing above)"))
+        say("INFO", f"after re-opening, the draft folder holds {sorted(p.name for p in folder.iterdir())}")
+
+    input(f"  Close CapCut so the test draft can be removed, then press Enter ")
+    quit_app()
+    shutil.rmtree(folder, ignore_errors=True)
+    shutil.rmtree(tmp, ignore_errors=True)
+    root = json.loads(root_path.read_text(encoding="utf-8-sig"))
+    root["all_draft_store"] = [e for e in root["all_draft_store"] if e.get("draft_name") != name]
+    root_path.write_text(json.dumps(root, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    say("INFO", "test draft removed")
+
+
+FILE_LANE = ("doctor", "replay", "add-overlay", "add-text", "graphics", "transform", "remove",
+             "keyframe", "clear-keyframes", "ls", "launch", "quit")
+
+
 def main():
     args = sys.argv[1:]
     if not args:
         sys.exit(USAGE)
     cmd, rest = args[0], args[1:]
-    if cmd == "replay":
+    if not MAC and cmd not in FILE_LANE:
+        sys.exit(f"'{cmd}' is a live-lane command (macOS only). On Windows: {', '.join(FILE_LANE)}")
+    if cmd == "doctor":
+        cmd_doctor("--live" in rest)
+    elif cmd == "replay":
         cmd_replay(rest[0], opt(rest, "--name"))
     elif cmd == "add-overlay":
         add_overlay(rest[0], rest[1], opt(rest, "--at", float, 0.0),
@@ -1297,7 +1532,7 @@ def main():
     elif cmd == "state":
         cmd_state(opt(rest, "--draft"))
     elif cmd == "ls":
-        root = json.loads((DRAFT_ROOT / "root_meta_info.json").read_text())
+        root = json.loads((DRAFT_ROOT / "root_meta_info.json").read_text(encoding="utf-8-sig"))
         for d in root["all_draft_store"]:
             print(f"{d['draft_name']}: {d['tm_duration'] / 1e6:.2f}s  {d['draft_fold_path']}")
     elif cmd == "launch":
