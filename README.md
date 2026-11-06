@@ -2,7 +2,8 @@
 
 CapCut has no API. This kit drives it two other ways: editing its draft files
 directly on disk, and clicking its real UI through the macOS accessibility
-tree. macOS only, needs the CapCut desktop app and `uv` (`brew install uv`).
+tree. Needs the CapCut desktop app, `uv`, and `ffmpeg`/`ffprobe` on PATH.
+The live lane is macOS only; the file lane should also run on Windows (untested, see below).
 
 Run any command with:
 
@@ -12,12 +13,59 @@ uv run capcut-bridge.py <command> ...
 
 The script's `# /// script` header declares its two dependencies
 (`pyobjc-framework-ApplicationServices`, `pyobjc-framework-Quartz`) — `uv run`
-installs them itself on first use, no setup step needed.
+installs them itself on first use, no setup step needed (they're skipped on
+Windows, where nothing extra is required).
+
+## Windows
+
+Only the file lane works: `replay`, `add-overlay`, `add-text`, `graphics`,
+`transform`, `remove`, `keyframe`, `clear-keyframes`, `ls`, `launch`, `quit`.
+Live-lane commands exit with an error.
+
+- Install: `winget install astral-sh.uv Gyan.FFmpeg`, then
+  `uv run capcut-bridge.py <command> ...` in PowerShell.
+- Drafts are expected under
+  `%LOCALAPPDATA%\CapCut\User Data\Projects\com.lveditor.draft`. If CapCut
+  is set to save drafts elsewhere (Settings → Draft location), set
+  `CAPCUT_DRAFTS` to that folder.
+- CapCut is relaunched from `%LOCALAPPDATA%\CapCut\Apps\CapCut.exe`; set
+  `CAPCUT_EXE` if it's installed elsewhere.
+- There's no `~/Movies` sandbox on Windows, but media is still hardlinked into
+  the draft's `Resources/` (copied if the footage is on a different drive).
+- After a file-lane edit the bridge relaunches CapCut but can't reopen the
+  draft for you — open it from the home screen.
+
+### Check a Windows machine first
+
+Windows support is untested on real hardware. Run the doctor before relying on it:
+
+```powershell
+uv run capcut-bridge.py doctor          # read-only checks, ~2 seconds
+uv run capcut-bridge.py doctor --live   # also round-trips a test draft through CapCut
+```
+
+Make and save at least one short draft in CapCut first, so the doctor can learn the
+draft format. `--live` closes CapCut (save your work), writes a draft called
+`capcut-kit-doctor`, asks you to confirm what CapCut shows, then removes it. Both
+write `capcut-doctor-report.txt`; send that file back if anything fails.
+
+Each failure prints the fix to try. The ones it knows about:
+
+| Problem | Fix |
+|---|---|
+| Drafts folder elsewhere | `CAPCUT_DRAFTS=<folder>` |
+| CapCut installed elsewhere | `CAPCUT_EXE=<path to CapCut.exe>` |
+| Timeline file has the other name | `CAPCUT_DRAFT_FILE=draft_info.json` or `draft_content.json` (normally auto-detected from your drafts) |
+| CapCut won't close when asked (tray or prompt) | `CAPCUT_FORCE_QUIT=1` |
+| Draft files aren't JSON | This CapCut version encrypts drafts; the file lane can't work with it |
+
+Set a variable for the session with `$env:CAPCUT_FORCE_QUIT = "1"` in PowerShell.
 
 ## The two lanes
 
 **File lane** (structural builds) — CapCut drafts are plain JSON under
-`~/Movies/CapCut/User Data/Projects/com.lveditor.draft/<name>/`. The bridge
+`~/Movies/CapCut/User Data/Projects/com.lveditor.draft/<name>/` (macOS; see
+Windows above for its path). The bridge
 writes/edits that JSON directly, which means CapCut must be **fully closed**
 while it does — the app owns that folder and rewrites its own registry on
 quit, clobbering anything written while it was open. The bridge handles this
@@ -66,7 +114,7 @@ Run with no arguments for this same list from the script itself.
   any draft the bridge just wrote or edited. The bridge quits/relaunches
   around every file-lane write — don't call file-lane commands while
   bypassing that.
-- **Raw footage must live under `~/Movies`.** CapCut's sandbox can only read
+- **Raw footage must live under `~/Movies`** (macOS). CapCut's sandbox can only read
   that tree, so paths outside it show up as broken red "File not accessible"
   clips. The bridge handles this by hardlinking source media into the
   draft's own `Resources/` folder — never point it at footage elsewhere and
